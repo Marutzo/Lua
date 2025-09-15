@@ -260,7 +260,7 @@ print(say("{(score > bonus)}"))                      -- true
 print(say("{(exp.current >= exp.nextLevel)}"))       -- false
 print(say("{(player.level == 5)}"))                  -- true
 print(say("{(player.level != 10)}"))                 -- true
-print(say("{(score > exp.current)b}"))               --  true as 1 or explicit b suffix? (your choice handling)
+print(say("{(score > exp.current)b}"))               -- 1 for true 0 for false, b flag at end of (comparisons) 
 
 print("\n=== Escaping ===")
 print(say("Literal brace: \\{this is not interpolated\\}")) -- this is not interpolated
