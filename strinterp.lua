@@ -11,7 +11,7 @@ local function resolve(name, env)
     return val
 end
 
--- Tokenizer (handles multi-char operators)
+-- Tokenizer (handles multi-char operators, string literals, keywords)
 local function tokenize(expr)
     local tokens = {}
     local i = 1
@@ -21,21 +21,61 @@ local function tokenize(expr)
             i = i + 1
         else
             local two = expr:sub(i,i+1)
-            if two == "//" or two == "==" or two == "!=" or two == "<=" or two == ">=" then
+            local three = expr:sub(i,i+2)
+
+            -- keywords: and/or/not (make sure not part of identifier)
+            if three == "and" and not expr:sub(i+3,i+3):match("[%w_]") then
+                table.insert(tokens, "and"); i = i + 3
+            elseif two == "or" and not expr:sub(i+2,i+2):match("[%w_]") then
+                table.insert(tokens, "or"); i = i + 2
+            elseif three == "not" and not expr:sub(i+3,i+3):match("[%w_]") then
+                table.insert(tokens, "not"); i = i + 3
+
+            -- multi-char operators (order matters)
+            elseif two == "//" or two == "==" or two == "!=" or two == "~=" or two == "<=" or two == ">=" or two == ".." then
                 table.insert(tokens, two)
                 i = i + 2
-            elseif c:match("[%+%-%*%%%^/%(%)]") or c == "<" or c == ">" then
+
+            -- string literal
+            elseif c == "'" or c == '"' then
+                local quote = c
+                local j = i + 1
+                local buf = {}
+                while j <= #expr do
+                    local ch = expr:sub(j,j)
+                    if ch == "\\" and j < #expr then
+                        -- escape next char
+                        table.insert(buf, expr:sub(j+1,j+1))
+                        j = j + 2
+                    elseif ch == quote then
+                        break
+                    else
+                        table.insert(buf, ch)
+                        j = j + 1
+                    end
+                end
+                table.insert(tokens, {is_str = true, val = table.concat(buf)})
+                i = j + 1
+
+            -- single-char operators and punctuation (includes comma)
+            elseif c:match("[%+%-%*%%%^/%(%),<>]") then
                 table.insert(tokens, c)
                 i = i + 1
+
+            -- number
             elseif c:match("%d") then
                 local num = expr:match("^%d+%.?%d*", i)
                 table.insert(tokens, tonumber(num))
                 i = i + #num
+
+            -- identifier (may include dots)
             elseif c:match("[%a_]") then
                 local var = expr:match("^[%a_][%w_%.]*", i)
                 table.insert(tokens, var)
                 i = i + #var
+
             else
+                -- unknown char: skip
                 i = i + 1
             end
         end
@@ -56,13 +96,12 @@ local function numToString(n)
     end
 end
 
--- Recursive descent parser with boolean<->number coercion helpers
+-- Parser with function-call and concat support
 local function parse(tokens, env)
     local pos = 1
     local function peek() return tokens[pos] end
     local function nextToken() pos = pos + 1; return tokens[pos-1] end
 
-    -- helpers
     local function toBool(x)
         if type(x) == "boolean" then return x end
         if type(x) == "number" then return x ~= 0 end
@@ -73,20 +112,40 @@ local function parse(tokens, env)
         if type(x) == "boolean" then return x and 1 or 0 end
         error("expected number in arithmetic, got "..type(x))
     end
+    local function toStrForConcat(x)
+        if type(x) == "number" then return numToString(x) end
+        if type(x) == "boolean" then return tostring(x) end
+        if type(x) == "string" then return x end
+        return tostring(x)
+    end
 
     local expr, term, factor, power, base, comparison, logic
 
+    -- parse argument list for function calls
+    local function parseArgs()
+        local args = {}
+        if peek() ~= ")" then
+            repeat
+                table.insert(args, logic()) -- full expression allowed as arg
+                if peek() == "," then nextToken() end
+            until peek() == ")"
+        end
+        return args
+    end
+
     base = function()
         local tok = nextToken()
-        if type(tok) == "number" then
+        -- string literal token stored as table {is_str=true, val=...}
+        if type(tok) == "table" and tok.is_str then
+            return tok.val
+        elseif type(tok) == "number" then
             return tok
-        elseif tok == "(" then
-            local val = logic()
-            if nextToken() ~= ")" then error("Expected )") end
-            return val
         elseif type(tok) == "string" then
-            if tok == "not" then
-                -- logical not: work on boolean coercion
+            if tok == "(" then
+                local val = logic()
+                if nextToken() ~= ")" then error("Expected )") end
+                return val
+            elseif tok == "not" then
                 return not toBool(base())
             elseif tok == "true" then
                 return true
@@ -94,7 +153,18 @@ local function parse(tokens, env)
                 return false
             else
                 local val = resolve(tok, env)
-                if type(val) == "number" or type(val) == "boolean" then
+                -- function call?
+                if peek() == "(" then
+                    nextToken() -- consume "("
+                    local args = parseArgs()
+                    if nextToken() ~= ")" then error("Expected ) after args") end
+                    if type(val) ~= "function" then
+                        error("Attempt to call non-function: "..tok)
+                    end
+                    return val(table.unpack(args))
+                end
+                -- variable
+                if type(val) == "number" or type(val) == "boolean" or type(val) == "string" then
                     return val
                 else
                     error("Variable '"..tok.."' is not usable in expression")
@@ -119,7 +189,7 @@ local function parse(tokens, env)
         while peek() == "^" do
             nextToken()
             local rhs = power()
-            val = toNumber(val) ^ toNumber(rhs)  -- coerce booleans to numbers for math
+            val = toNumber(val) ^ toNumber(rhs)
         end
         return val
     end
@@ -154,13 +224,24 @@ local function parse(tokens, env)
         return val
     end
 
-    comparison = function()
+    -- concatenation .. (lower precedence than + - so we run expr() first)
+    local function concatLevel()
         local val = expr()
-        while peek() == "==" or peek() == "!=" or peek() == "<" or peek() == ">" or peek() == "<=" or peek() == ">=" do
-            local op = nextToken()
+        while peek() == ".." do
+            nextToken()
             local right = expr()
+            val = toStrForConcat(val) .. toStrForConcat(right)
+        end
+        return val
+    end
+
+    comparison = function()
+        local val = concatLevel()
+        while peek() == "==" or peek() == "!=" or peek() == "~=" or peek() == "<" or peek() == ">" or peek() == "<=" or peek() == ">=" do
+            local op = nextToken()
+            local right = concatLevel()
             if op == "==" then val = (val == right)
-            elseif op == "!=" then val = (val ~= right)
+            elseif op == "!=" or op == "~=" then val = (val ~= right)
             elseif op == "<" then val = (val < right)
             elseif op == ">" then val = (val > right)
             elseif op == "<=" then val = (val <= right)
@@ -185,7 +266,7 @@ local function parse(tokens, env)
     return result
 end
 
--- Interpolator (merged, with escaping, b-flag for booleans, and num formatting)
+-- Interpolator (with escaping, b-flag, function-calls, formatting)
 function interp(str, env)
     local out = {}
     local i = 1
@@ -200,6 +281,7 @@ function interp(str, env)
                 table.insert(out, literal)
                 i = close + 2
             else
+                -- lone \{ -> literal {
                 table.insert(out, "{")
                 i = i + 2
             end
@@ -211,18 +293,26 @@ function interp(str, env)
                 local original_expr = str:sub(i+1, close-1)
                 local expr = original_expr:gsub("^%s*", ""):gsub("%s*$", "") -- trim both ends
 
-                -- detect trailing 'b' flag inside braces (eg. {(a>b)b} or {(a>b)}b form handled by user)
+                -- detect trailing 'b' inside braces
                 local hasB = false
                 if expr:sub(-1) == "b" then
                     hasB = true
-                    expr = expr:sub(1, -2)
-                    expr = expr:gsub("^%s*", ""):gsub("%s*$", "")
+                    expr = expr:sub(1, -2):gsub("%s*$", "")
                 end
 
-                -- Direct table/variable lookup on trimmed inner expr
-                local direct = resolve(expr, env)
+                -- detect trailing b after the closing brace, e.g. {(a>b)}b
+                local afterB = false
+                if not hasB and str:sub(close+1, close+1) == "b" then
+                    hasB = true
+                    afterB = true
+                end
+
+                -- direct lookup
+                local direct = nil
+                local ok, rd = pcall(function() return resolve(expr, env) end)
+                if ok then direct = rd end
+
                 if direct ~= nil and type(direct) ~= "table" then
-                    -- direct variable: print formatted number/boolean appropriately
                     if type(direct) == "boolean" then
                         if hasB then
                             table.insert(out, tostring(direct))
@@ -233,12 +323,10 @@ function interp(str, env)
                         table.insert(out, numToString(direct))
                     end
                 else
-                    -- Evaluate expression
                     local success, val = pcall(function()
                         local tokens = tokenize(expr)
                         return parse(tokens, env)
                     end)
-
                     if success and val ~= nil then
                         if type(val) == "boolean" then
                             if hasB then
@@ -246,16 +334,21 @@ function interp(str, env)
                             else
                                 table.insert(out, val and "1" or "0")
                             end
-                        else
+                        elseif type(val) == "number" then
                             table.insert(out, numToString(val))
+                        else
+                            table.insert(out, tostring(val))
                         end
                     else
-                        -- fallback: preserve original (untrimmed) expression inside braces
                         table.insert(out, "{"..original_expr.."}")
                     end
                 end
 
-                i = close + 1
+                if afterB then
+                    i = close + 2
+                else
+                    i = close + 1
+                end
             else
                 table.insert(out, c)
                 i = i + 1
@@ -353,3 +446,22 @@ print(test("{pi * (player.stats.hp - player.stats.mp)}"))  -- 3.14159 * 80 ≈ 2
 print(test("{(score > bonus) * 10}"))             -- true coerces to 1 → 10
 print(test("{(score < bonus) * 10}"))             -- false coerces to 0 → 0
 print(test("{(score > bonus) + (exp.current < exp.nextLevel)}")) -- 1 + 1 = 2
+
+-- Add some functions to env
+env.max = math.max
+env.min = math.min
+env.pow = math.pow
+env.floor = math.floor
+env.upper = string.upper
+env.concat = function(a, b) return a .. b end
+
+print("\n=== Function Calls ===")
+print(test("{max(score, bonus)}"))              -- 42 vs 8 → 42
+print(test("{min(score, bonus)}"))              -- 8
+print(test("{pow(2, 10)}"))                     -- 1024
+print(test("{floor(8.9)}"))                     -- 8
+print(test("{upper(player.name)}"))             -- RETRO
+print(test("{concat(player.name, '_L' .. player.level)}")) -- Retro_L5
+print(test("{max(score, bonus * multiplier)}")) -- max(42, 16) = 42
+print(test("{pow(score + bonus, multiplier)}")) -- (42+8)^2 = 2500
+
